@@ -1024,6 +1024,16 @@ target_compile_definitions(test_qwen4_exp_scaffold PRIVATE
 # nothing on the public ABI. Same arrangement test_dots3_note_scaffold uses.
 target_include_directories(test_qwen4_exp_scaffold PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
+# Qwen4-Exp W5c (#2031) -- the KV-cache spec, driven through the PRODUCTION
+# `make_kv_cache` registry hook rather than by constructing spec structs. Three
+# groups: the QSA layers' paged K+V, ONE uniform recurrent group carrying four
+# states on every linear-attention layer, and the QSA indexer side cache as an
+# `MLAAttentionSpec` at compress_ratio 4. Fixture is the published
+# `Qwen/Qwen3.8-Flash-Next` config.json verbatim.
+vllm_cpp_add_test(test_qwen4_exp_kv_cache vllm/models/test_qwen4_exp_kv_cache.cpp)
+target_compile_definitions(test_qwen4_exp_kv_cache PRIVATE
+  QWEN4_EXP_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/qwen4_exp")
+
 # GLM-5.3-Flash (`Glm5NextForConditionalGeneration`) W1 -- the config layer and
 # the two production entry points that reach it: `ModelRegistry::Resolve` and
 # the `general.architecture` GGUF dispatch. No numerics: W1 has none. The
@@ -1048,6 +1058,23 @@ target_include_directories(test_glm5_next_scaffold PRIVATE ${CMAKE_CURRENT_SOURC
 vllm_cpp_add_test(test_glm5_next_mhc vllm/models/test_glm5_next_mhc.cpp)
 target_include_directories(test_glm5_next_mhc PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_include_directories(test_glm5_next_mhc PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures)
+
+# GLM-5.3-Flash W3 -- the DSA indexer's k-pool compression (#2213). Gates the
+# stage `deepseek_v4_dsa.cpp` does NOT have: the top-k runs over LEARNED pooled
+# candidates, not raw tokens, and the ragged tail is appended raw and unscored.
+# The fixture runs at seq_len 21 against index_topk 8 ON PURPOSE -- at or below
+# index_topk a raw top-k selects everything and the pooling is unobservable --
+# and asserts SET equality of the selected indices, because top-k error is
+# bimodal and a tolerance on the values passes a wrong selection. Goldens are the
+# RUN output of transformers v5.16.1, captured by
+# `fixtures/gen_glm5_next_dsa_goldens.py`. `glm5_next_dsa.h` is MODEL-PRIVATE
+# under src/, the same arrangement `glm5_next_mhc.h` uses.
+vllm_cpp_add_test(test_glm5_next_dsa vllm/models/test_glm5_next_dsa.cpp)
+target_compile_definitions(test_glm5_next_dsa PRIVATE
+  GLM5_NEXT_CKPT_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures/glm5_next")
+target_include_directories(test_glm5_next_dsa PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(test_glm5_next_dsa PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/vllm/models/fixtures)
 
 # dots3-note W3 -- the FULL-attention layer (#699, #1846,
