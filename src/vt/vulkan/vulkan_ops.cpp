@@ -979,23 +979,6 @@ bool GemvMatmulUsable(bool bt, int64_t k, int64_t m) {
 // surviving workgroup interleaves reads from rows k*2 bytes apart. The activation
 // re-reads it saves were L2 hits, which were never the constraint.
 
-// BISECT HOOK (temporary): VT_VK_DISABLE=kMoeRouterTopK,kMoeCombine,... skips
-// registering the named ops so they fall back to the reference tier.
-bool VkOpDisabled(const char* op_name) {
-  const char* v = std::getenv("VT_VK_DISABLE");
-  if (v == nullptr || *v == '\0') return false;
-  const std::string s(v);
-  size_t pos = 0;
-  while (pos <= s.size()) {
-    size_t comma = s.find(',', pos);
-    std::string tok = s.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
-    if (tok == op_name) return true;
-    if (comma == std::string::npos) break;
-    pos = comma + 1;
-  }
-  return false;
-}
-
 constexpr uint32_t kGemvRowsDefault = 1;
 constexpr uint32_t kGemvPackDefault = 2;
 
@@ -1293,12 +1276,7 @@ void PagedAttentionKernel(Queue& q, Tensor& out, const Tensor& query, const Tens
   // forwards to the next provider down, which is exactly what GetOpFallback is
   // for (op_provider.h:94-100: per-call refusal belongs in the kernel, because
   // GetOp has no shape or dtype to inspect).
-  // BISECT: VT_VK_DISABLE_PAGED_ATTN=1 forces every call down to the portable tier.
-  static const bool kForcePaFallback = [] {
-    const char* e = std::getenv("VT_VK_DISABLE_PAGED_ATTN");
-    return e != nullptr && e[0] != 0 && std::strcmp(e, "0") != 0;
-  }();
-  if (kForcePaFallback || args.kv_cache_dtype != vt::Fp8KVCacheDataType::kAuto) {
+  if (args.kv_cache_dtype != vt::Fp8KVCacheDataType::kAuto) {
     auto next = reinterpret_cast<PagedAttentionFn>(
         GetOpFallback(OpId::kPagedAttention, DeviceType::kVULKAN, kNativeProviderName));
     next(q, out, query, k_cache, v_cache, block_table, seq_lens, query_start_loc, args);
@@ -2567,9 +2545,9 @@ struct Registrar {
                reinterpret_cast<void*>(static_cast<QkvSplitFn>(&QkvSplitKernel)));
     RegisterOp(OpId::kRopeFromCache, DeviceType::kVULKAN,
                reinterpret_cast<void*>(static_cast<RopeFromCacheFn>(&RopeFromCacheKernel)));
-    if (!VkOpDisabled("kReshapeAndCache"))     RegisterOp(OpId::kReshapeAndCache, DeviceType::kVULKAN,
+    RegisterOp(OpId::kReshapeAndCache, DeviceType::kVULKAN,
                reinterpret_cast<void*>(static_cast<ReshapeAndCacheFn>(&ReshapeAndCacheKernel)));
-    if (!VkOpDisabled("kPagedAttention"))     RegisterOp(OpId::kPagedAttention, DeviceType::kVULKAN,
+    RegisterOp(OpId::kPagedAttention, DeviceType::kVULKAN,
                reinterpret_cast<void*>(static_cast<PagedAttentionFn>(&PagedAttentionKernel)));
     RegisterOp(OpId::kEmbedding, DeviceType::kVULKAN,
                reinterpret_cast<void*>(static_cast<EmbeddingFn>(&EmbeddingKernel)));
@@ -2649,7 +2627,7 @@ struct Registrar {
     // VK4 (B60 maple row): the four ops the maple graph was still draining to
     // the host for. The rotary TABLE BUILD joins its apply half; see
     // RopeCosSinCacheKernel above for why the old "no f64 in GLSL" note retired.
-    if (!VkOpDisabled("kRopeCosSinCache"))     RegisterOp(
+    RegisterOp(
         OpId::kRopeCosSinCache, DeviceType::kVULKAN,
         reinterpret_cast<void*>(static_cast<RopeCosSinCacheFn>(&RopeCosSinCacheKernel)));
     // BACKEND-VULKAN-KEEPQUANT: the GGUF compute-in-quant GEMMs, by CPU
@@ -2659,21 +2637,20 @@ struct Registrar {
     // 32 GB OOM). The grouped twin rides along for MoE models.
     RegisterOp(OpId::kMatmulBTQuant, DeviceType::kVULKAN,
                reinterpret_cast<void*>(static_cast<MatmulFn>(&MatmulBTQuantKernelVulkan)));
-    if (!VkOpDisabled("kRopeNeox"))     RegisterOp(OpId::kRopeNeox, DeviceType::kVULKAN,
+    RegisterOp(OpId::kRopeNeox, DeviceType::kVULKAN,
                reinterpret_cast<void*>(static_cast<RopeFn>(&RopeNeoxKernel)));
-    if (!VkOpDisabled("kMoeCombine"))     RegisterOp(
+    RegisterOp(
         OpId::kMoeCombine, DeviceType::kVULKAN,
         reinterpret_cast<void*>(static_cast<MoeCombineFn>(&MoeCombineKernelVulkan)));
-    if (!VkOpDisabled("kMoeRouterTopK"))     RegisterOp(OpId::kMoeRouterTopK, DeviceType::kVULKAN,
+    RegisterOp(OpId::kMoeRouterTopK, DeviceType::kVULKAN,
                reinterpret_cast<void*>(
                    static_cast<MoeRouterTopKFn>(&MoeRouterTopKKernelVulkan)));
     RegisterOp(OpId::kMatmulBTQuantGrouped, DeviceType::kVULKAN,
                reinterpret_cast<void*>(
                    static_cast<MatmulBTQuantGroupedFn>(&MatmulBTQuantGroupedKernelVulkan)));
-    if (!VkOpDisabled("kMoeGateUpSwiGLUGrouped"))
-      RegisterOp(OpId::kMoeGateUpSwiGLUGrouped, DeviceType::kVULKAN,
-                 reinterpret_cast<void*>(static_cast<MoeGateUpSwiGLUGroupedFn>(
-                     &MoeGateUpSwiGLUGroupedKernelVulkan)));
+    RegisterOp(OpId::kMoeGateUpSwiGLUGrouped, DeviceType::kVULKAN,
+               reinterpret_cast<void*>(static_cast<MoeGateUpSwiGLUGroupedFn>(
+                   &MoeGateUpSwiGLUGroupedKernelVulkan)));
   }
 } registrar;
 
