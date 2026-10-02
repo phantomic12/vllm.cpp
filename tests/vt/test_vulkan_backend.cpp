@@ -643,6 +643,44 @@ TEST_CASE("Vulkan registers the W0 op set and NOT the unimplemented rest") {
   CHECK(vt::GetReferenceTierHits() > 0);
 }
 
+// BACKEND-VULKAN-BISECT-REMOVAL (#3372): the seven ops the temporary
+// VT_VK_DISABLE / VT_VK_DISABLE_PAGED_ATTN bisect hooks gated (commit
+// 3d8aff627), pinned NATIVE so a future row cannot quietly re-drain
+// them. The hazard outlives the hooks: on a unified-memory Vulkan
+// device an op with no native registration is still SERVED -- the
+// portable reference tier lazily installs the CPU kernel at priority
+// -1000 -- so the model runs, correctly and arbitrarily slowly, and
+// only its timing betrays the drain. The W0 op-set case above asserts
+// kReshapeAndCache and kPagedAttention; the five VK4 keep-quant
+// additions are named there at most in prose, never checked.
+TEST_CASE("the seven VT_VK bisect targets resolve NATIVELY on Vulkan") {
+  if (!VulkanPresent()) return;
+  for (vt::OpId op : {vt::OpId::kReshapeAndCache, vt::OpId::kPagedAttention,
+                      vt::OpId::kRopeCosSinCache, vt::OpId::kRopeNeox,
+                      vt::OpId::kMoeCombine, vt::OpId::kMoeRouterTopK,
+                      vt::OpId::kMoeGateUpSwiGLUGrouped}) {
+    CAPTURE(vt::OpName(op));
+    // The NATIVE-ONLY probe: OpRegistered deliberately skips the
+    // reference tier (src/vt/op_provider.cpp), so a host kernel cannot
+    // pass as registered here -- this is the CHECK that goes red if a
+    // guard comes back.
+    CHECK(vt::OpRegistered(op, DeviceType::kVULKAN));
+    // And through the real resolution path, BY NAME: the W0 case above
+    // shows what a drain looks like (last_selected names the reference
+    // tier for kApplyTemperature), so the same instrumentation here
+    // must prove the opposite. A native registration sits at priority 0
+    // against the reference tier's -1000, so the bound provider is
+    // vt-native -- anything else IS the silent drain this case exists
+    // to catch.
+    void* fn = nullptr;
+    CHECK_NOTHROW(fn = vt::GetOp(op, DeviceType::kVULKAN));
+    CHECK(fn != nullptr);
+    const auto stats = vt::GetOpProviderStats(op, DeviceType::kVULKAN);
+    REQUIRE(stats.last_selected != nullptr);
+    CHECK(std::string(stats.last_selected) == std::string(vt::kNativeProviderName));
+  }
+}
+
 TEST_CASE("cooperative-matrix capability is PROBED, and absent on llvmpipe") {
   if (!VulkanPresent()) return;
   auto& ctx = vt::vulkan::VulkanContext::Get();
