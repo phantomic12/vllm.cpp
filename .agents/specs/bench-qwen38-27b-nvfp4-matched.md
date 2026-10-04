@@ -338,3 +338,5 @@ leg E, and re-cut the job's source tarball so leg F carries the arm.
   asks 2 and 3, whose runnable plan is in
   [`qwen38-27b-quant-arms.md`](qwen38-27b-quant-arms.md).
 - The `## Outcome` section this spec owes at `DONE`.
+- The `096e805bb` stale-base clobber that reverted this harness's bench flags
+  and block-size fix: `ISSUE-LOCAL-01M448WBTEGX4587Z37FPEN4H7`.
