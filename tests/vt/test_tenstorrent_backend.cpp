@@ -570,6 +570,106 @@ TEST_CASE("kTENSTORRENT kRmsNorm matches a host F32 reference (weight, no residu
   CHECK(max_abs_diff < 0.5f);
 }
 
+// BF16 per-head norm arm (the kolibri1 q/k-norm shape): bf16 in, bf16 out,
+// 48x128 — a shape whose tile padding (48 rows in a 64-row TILE) the pinned
+// tt-metal's bf16 rms_norm mishandled. RED-FIRST evidence: on the pin-forward
+// stack this case's predecessor state produced zeros/1e38 garbage from the
+// device bf16 arm (the kolibri1 TT model's attention output was exactly zero
+// at every layer — the q/k norms are the first bf16 RmsNorm of each block),
+// and the f32-shadow kernel arm (the fix) reproduces the host f32 oracle.
+// The f32 shadow matches the CPU oracle's f32 sumsq MORE closely than the
+// bf16 arm it replaced; the one bf16 output rounding is the store.
+TEST_CASE("kTENSTORRENT kRmsNorm bf16 [48,128] per-head arm matches the host f32 oracle") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kRmsNorm, DeviceType::kTENSTORRENT));
+
+  constexpr int64_t Rows = 48, D = 128;
+  constexpr float Eps = 1e-6f;
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  auto rms_norm = reinterpret_cast<vt::RmsNormFn>(
+      vt::GetOp(vt::OpId::kRmsNorm, DeviceType::kTENSTORRENT));
+
+  std::mt19937 rng(20261009);
+  std::uniform_real_distribution<float> val(-2.0f, 2.0f);
+  auto bf16 = [](float v) {
+    uint32_t b;
+    std::memcpy(&b, &v, sizeof(b));
+    return static_cast<uint16_t>((b + 0x7fff + ((b >> 16) & 1)) >> 16);
+  };
+  auto widen = [](uint16_t b) {
+    float v;
+    const uint32_t bits = static_cast<uint32_t>(b) << 16;
+    std::memcpy(&v, &bits, sizeof(v));
+    return v;
+  };
+  std::vector<uint16_t> hx(Rows * D), hw(D);
+  std::vector<float> xf(Rows * D), wf(D);
+  for (size_t i = 0; i < hx.size(); ++i) {
+    xf[i] = val(rng);
+    hx[i] = bf16(xf[i]);
+    xf[i] = widen(hx[i]);  // the oracle reads the stored bf16, as the kernel does
+  }
+  for (int64_t j = 0; j < D; ++j) {
+    wf[j] = 0.5f + static_cast<float>(j % 5) * 0.1f;
+    hw[j] = bf16(wf[j]);
+    wf[j] = widen(hw[j]);
+  }
+
+  void* mem_x = backend.Alloc(hx.size() * 2);
+  void* mem_w = backend.Alloc(hw.size() * 2);
+  void* mem_out = backend.Alloc(hx.size() * 2);
+  Queue q = backend.CreateQueue();
+  backend.Copy(q, mem_x, hx.data(), hx.size() * 2);
+  backend.Copy(q, mem_w, hw.data(), hw.size() * 2);
+
+  Tensor x = Tensor::Contiguous(mem_x, vt::DType::kBF16,
+                                Device{DeviceType::kTENSTORRENT, 0}, {Rows, D});
+  Tensor w = Tensor::Contiguous(mem_w, vt::DType::kBF16,
+                                Device{DeviceType::kTENSTORRENT, 0}, {D});
+  Tensor out = Tensor::Contiguous(mem_out, vt::DType::kBF16,
+                                  Device{DeviceType::kTENSTORRENT, 0}, {Rows, D});
+  vt::RmsNormArgs args;
+  args.eps = Eps;
+  args.gemma = false;
+  rms_norm(q, out, x, w, args, /*residual=*/nullptr);
+
+  // Read through the backend seam: the op leaves out device-current.
+  std::vector<uint16_t> ho(hx.size());
+  backend.Copy(q, ho.data(), mem_out, ho.size() * 2);
+  backend.Synchronize(q);
+  backend.Free(mem_x);
+  backend.Free(mem_w);
+  backend.Free(mem_out);
+
+  int nans = 0;
+  double worst_rel = 0.0;
+  for (int64_t r = 0; r < Rows; ++r) {
+    double sumsq = 0.0;
+    for (int64_t j = 0; j < D; ++j) sumsq += static_cast<double>(xf[r * D + j]) *
+                                            static_cast<double>(xf[r * D + j]);
+    const double inv = 1.0 / std::sqrt(sumsq / static_cast<double>(D) + Eps);
+    for (int64_t j = 0; j < D; ++j) {
+      const float got = widen(ho[r * D + j]);
+      if (std::isnan(got)) {
+        ++nans;
+        continue;
+      }
+      const double ref =
+          static_cast<double>(xf[r * D + j]) * inv * static_cast<double>(wf[j]);
+      worst_rel = std::max(worst_rel,
+                           std::fabs(static_cast<double>(got) - ref) /
+                               std::max(1e-6, std::fabs(ref)));
+    }
+  }
+  CHECK(nans == 0);
+  // One bf16 output rounding of an f32-computed norm: 2^-8 relative + slack
+  // for the f32 tile roundings inside the norm.
+  CHECK(worst_rel < 0.02);
+}
+
 // Gemma style (w+1) — the Qwen3.5 norm (every RmsNorm site passes gemma=true).
 // The device arm must bake +1 into the gamma it hands ttnn::rms_norm; dropping
 // it collapsed ambient host-free prefill to `,` (BACKEND-TENSTORRENT-QWEN35
@@ -735,6 +835,133 @@ TEST_CASE("kTENSTORRENT kMoeSiluMul matches host F32 within BF16 envelope") {
   }
   // BF16 tile storage + silu; same envelope as the kSiluAndMul sibling.
   CHECK(max_abs_diff < 0.05f);
+}
+
+// kMoeCombine: the routed-expert weighted sum (cpu_ops.cpp MoeCombineKernel
+// is the CPU oracle; kolibri1_tt_forward.cpp's streaming MoE is the caller).
+// RED-first for the B2b-ii device half: this case was written and run RED
+// while no TT kernel existed for kMoeCombine — the op refused by name at
+// src/vt/op_provider.cpp Resolve() ("no kernel for op MoeCombine ... and the
+// device memory is not host-addressable"), so REQUIRE(OpRegistered) failed.
+//
+// CONTRACT: f32 accumulation over the top-k slots in index order, one
+// standalone f32 multiply by routed_scale on the finished accumulator, the
+// shared term added after the scale, ONE bf16 output rounding (RNE). The
+// envelope is therefore f32-accumulation exactness + 1 bf16 output ulp
+// (the project's bf16 precedent); a kernel that accumulates in bf16 or
+// rounds twice fails this case.
+TEST_CASE("kTENSTORRENT kMoeCombine matches the CPU reference within the f32-accumulate bf16 envelope") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kMoeCombine, DeviceType::kTENSTORRENT));
+  auto moe_combine = reinterpret_cast<vt::MoeCombineFn>(
+      vt::GetOp(vt::OpId::kMoeCombine, DeviceType::kTENSTORRENT));
+
+  constexpr int64_t T = 5, K = 3, H = 64;
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  std::mt19937 rng(20261009);
+  std::uniform_real_distribution<float> val(-3.0f, 3.0f);
+
+  // bf16 expert outputs / shared term (the kolibri1 polarity), f32 weights.
+  std::vector<uint16_t> host_eo(T * K * H), host_sh(T * H);
+  std::vector<float> host_w(T * K), host_eo_f(T * K * H), host_sh_f(T * H);
+  auto bf16 = [](float v) {
+    uint32_t b;
+    std::memcpy(&b, &v, sizeof(b));
+    return static_cast<uint16_t>((b + 0x7fff + ((b >> 16) & 1)) >> 16);  // RNE
+  };
+  auto widen = [](uint16_t b) {
+    float v;
+    const uint32_t bits = static_cast<uint32_t>(b) << 16;
+    std::memcpy(&v, &bits, sizeof(v));
+    return v;
+  };
+  for (size_t i = 0; i < host_eo.size(); ++i) {
+    host_eo_f[i] = val(rng);
+    host_eo[i] = bf16(host_eo_f[i]);
+  }
+  for (size_t i = 0; i < host_sh.size(); ++i) {
+    host_sh_f[i] = val(rng);
+    host_sh[i] = bf16(host_sh_f[i]);
+  }
+  for (size_t i = 0; i < host_w.size(); ++i) host_w[i] = val(rng);
+
+  for (int arm = 0; arm < 3; ++arm) {
+    // arm 0: shared term, routed_scale 1 (the model call); arm 1: no shared,
+    // non-unit scale (the scale/store ordering); arm 2: shared + f32 out.
+    const bool with_shared = arm != 1;
+    const float scale = arm == 1 ? 0.5f : 1.0f;
+    const vt::DType out_dt = arm == 2 ? vt::DType::kF32 : vt::DType::kBF16;
+
+    void* mem_eo = backend.Alloc(host_eo.size() * sizeof(uint16_t));
+    void* mem_w = backend.Alloc(host_w.size() * sizeof(float));
+    void* mem_sh = backend.Alloc(host_sh.size() * sizeof(uint16_t));
+    void* mem_out =
+        backend.Alloc(static_cast<size_t>(T * H) * (out_dt == vt::DType::kF32 ? 4 : 2));
+    Queue q = backend.CreateQueue();
+    backend.Copy(q, mem_eo, host_eo.data(), host_eo.size() * sizeof(uint16_t));
+    backend.Copy(q, mem_w, host_w.data(), host_w.size() * sizeof(float));
+    if (with_shared)
+      backend.Copy(q, mem_sh, host_sh.data(), host_sh.size() * sizeof(uint16_t));
+
+    // expert_out presents as rank-3 [T,K,H] (the vt::MoeCombine wrapper's shape).
+    Tensor eo = Tensor::Contiguous(mem_eo, vt::DType::kBF16,
+                                   Device{DeviceType::kTENSTORRENT, 0}, {T, K, H});
+    Tensor w = Tensor::Contiguous(mem_w, vt::DType::kF32,
+                                  Device{DeviceType::kTENSTORRENT, 0}, {T, K});
+    Tensor sh = Tensor::Contiguous(mem_sh, vt::DType::kBF16,
+                                   Device{DeviceType::kTENSTORRENT, 0}, {T, H});
+    Tensor out = Tensor::Contiguous(
+        mem_out, out_dt, Device{DeviceType::kTENSTORRENT, 0}, {T, H});
+    moe_combine(q, out, eo, w, with_shared ? &sh : nullptr, scale);
+    // Read back through the backend seam (the op may leave out host-current).
+    std::vector<uint8_t> raw(static_cast<size_t>(T * H) *
+                             (out_dt == vt::DType::kF32 ? 4 : 2));
+    std::memcpy(raw.data(), mem_out, raw.size());
+    backend.Free(mem_eo);
+    backend.Free(mem_w);
+    backend.Free(mem_sh);
+    backend.Free(mem_out);
+
+    for (int64_t t = 0; t < T; ++t) {
+      for (int64_t h = 0; h < H; ++h) {
+        // The CPU reference body (cpu_ops.cpp scalar loop), verbatim order:
+        // accumulate f32 over j, scale, add shared, one output store.
+        float acc = 0.0f;
+        for (int64_t j = 0; j < K; ++j)
+          acc += host_w[static_cast<size_t>(t * K + j)] *
+                 widen(host_eo[static_cast<size_t>((t * K + j) * H + h)]);
+        if (scale != 1.0f) acc *= scale;
+        if (with_shared)
+          acc += widen(host_sh[static_cast<size_t>(t * H + h)]);
+        // Widen the stored output back to f32 and measure the gap in bf16
+        // ulps of the reference.
+        double got;
+        if (out_dt == vt::DType::kF32) {
+          got = *reinterpret_cast<const float*>(raw.data() + sizeof(float) *
+                  static_cast<size_t>(t * H + h));
+        } else {
+          uint16_t bits;
+          std::memcpy(&bits,
+                      raw.data() + sizeof(uint16_t) * static_cast<size_t>(t * H + h), 2);
+          got = static_cast<double>(widen(bits));
+        }
+        double ref_b = static_cast<double>(widen(bf16(acc)));  // the one bf16 rounding
+        if (out_dt != vt::DType::kF32) {
+          // The kernel performs the identical f32 computation, so the bf16
+          // output must be EXACTLY the RNE of the f32 accumulator — not merely
+          // within an ulp (a double-round or a bf16 accumulation shows here).
+          CHECK(got == ref_b);
+        }
+        if (out_dt == vt::DType::kF32) {
+          // f32 out: the kernel must store the f32 accumulator itself.
+          CHECK(got == static_cast<double>(acc));
+        }
+      }
+    }
+  }
 }
 
 // Cast pair used by Qwen3 K/V cache dtype and logits paths.
@@ -1165,6 +1392,68 @@ TEST_CASE("kTENSTORRENT kQkvSplit device path matches host within BF16 envelope"
                     host_qkv[static_cast<size_t>(i * (Qd + Kd + Vd) + Qd + Kd + j)]));
   }
   CHECK(max_abs < 0.05f);
+}
+
+// Rank-3 outs [T, Hq, Dh]: the shape the OPT caller passes
+// (src/vllm/model_executor/models/opt.cpp) and that CPU/Vulkan/Metal QkvSplit
+// all accept — their flat-width contract is q_dim = Numel/t regardless of out
+// rank. Mirrors the sweep leg-1 throw (ISSUE-LOCAL-01M4J8TY34AKMC4NFACBNSA2ED).
+TEST_CASE("kTENSTORRENT kQkvSplit accepts rank-3 [T, H, Dh] outs (OPT shape)") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kQkvSplit, DeviceType::kTENSTORRENT));
+
+  // OPT-125M-like: equal widths, out rank 3.
+  constexpr int64_t T = 5, Hq = 12, Dh = 64, Hkv = 12;
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+
+  std::vector<float> host_qkv(static_cast<size_t>(T * 3 * Hq * Dh));
+  for (size_t i = 0; i < host_qkv.size(); ++i)
+    host_qkv[i] = static_cast<float>(i % 23) * 0.1f - 1.1f;
+
+  void* mem_qkv = backend.Alloc(host_qkv.size() * sizeof(float));
+  void* mem_q = backend.Alloc(static_cast<size_t>(T * Hq * Dh) * sizeof(float));
+  void* mem_k = backend.Alloc(static_cast<size_t>(T * Hkv * Dh) * sizeof(float));
+  void* mem_v = backend.Alloc(static_cast<size_t>(T * Hkv * Dh) * sizeof(float));
+  Queue q = backend.CreateQueue();
+  backend.Copy(q, mem_qkv, host_qkv.data(), host_qkv.size() * sizeof(float));
+
+  Tensor qkv = Tensor::Contiguous(mem_qkv, vt::DType::kF32,
+                                  Device{DeviceType::kTENSTORRENT, 0}, {T, 3 * Hq * Dh});
+  Tensor tq = Tensor::Contiguous(mem_q, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                 {T, Hq, Dh});
+  Tensor tk = Tensor::Contiguous(mem_k, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                 {T, Hkv, Dh});
+  Tensor tv = Tensor::Contiguous(mem_v, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0},
+                                 {T, Hkv, Dh});
+
+  auto split =
+      reinterpret_cast<vt::QkvSplitFn>(vt::GetOp(vt::OpId::kQkvSplit, DeviceType::kTENSTORRENT));
+  split(q, tq, tk, tv, qkv);
+
+  std::vector<float> host_q(static_cast<size_t>(T * Hq * Dh)),
+      host_k(static_cast<size_t>(T * Hkv * Dh)), host_v(static_cast<size_t>(T * Hkv * Dh));
+  backend.Copy(q, host_q.data(), mem_q, host_q.size() * sizeof(float));
+  backend.Copy(q, host_k.data(), mem_k, host_k.size() * sizeof(float));
+  backend.Copy(q, host_v.data(), mem_v, host_v.size() * sizeof(float));
+  backend.Free(mem_qkv);
+  backend.Free(mem_q);
+  backend.Free(mem_k);
+  backend.Free(mem_v);
+
+  for (int64_t i = 0; i < T; ++i) {
+    for (int64_t j = 0; j < Hq * Dh; ++j)
+      CHECK(host_q[static_cast<size_t>(i * Hq * Dh + j)] ==
+            host_qkv[static_cast<size_t>(i * 3 * Hq * Dh + j)]);
+    for (int64_t j = 0; j < Hkv * Dh; ++j) {
+      CHECK(host_k[static_cast<size_t>(i * Hkv * Dh + j)] ==
+            host_qkv[static_cast<size_t>(i * 3 * Hq * Dh + Hq * Dh + j)]);
+      CHECK(host_v[static_cast<size_t>(i * Hkv * Dh + j)] ==
+            host_qkv[static_cast<size_t>(i * 3 * Hq * Dh + 2 * Hq * Dh + j)]);
+    }
+  }
 }
 
 TEST_CASE("kTENSTORRENT kReshapeAndCache is BIT-EXACT incl. slot<0 skip") {
@@ -12073,3 +12362,166 @@ TEST_CASE("kTENSTORRENT wave-3 fused Q4_K decode launch is bit-exact to the chai
   // Exact-f32 decode arm, single chunk.
   run_shape(1, 130, 2560, rng);
 }
+
+// ---- kSigmoidBiasTopK: the Kolibri-1 router on device ------------------------
+// RED-FIRST: this gate ran red before the TT kernel existed (GetOp threw "no
+// kernel for SigmoidBiasTopK on kTENSTORRENT") and goes green only when the
+// device composite matches the CPU reference kernel (cpu_ops.cpp
+// SigmoidBiasTopKKernel, the exact port of SigmoidLogitAddRouting /
+// kolibri1.py:126-142): selection score = RAW logit + bias, weight = sigmoid
+// of the UNBIASED logit, no renormalization, ties to the LOWER expert index.
+TEST_CASE("kTENSTORRENT kSigmoidBiasTopK matches the CPU reference "
+          "(selection on biased raw logits, sigmoid-of-unbiased weights)") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  REQUIRE(vt::OpRegistered(vt::OpId::kSigmoidBiasTopK,
+                           DeviceType::kTENSTORRENT));
+
+  constexpr int64_t T = 4, E = 384, K = 6;
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  Queue q = backend.CreateQueue();
+
+  std::mt19937 rng(20261011u);
+  std::uniform_real_distribution<float> dist(-8.0f, 8.0f);
+  std::vector<float> host_logits(T * E), host_bias(E);
+  for (auto& v : host_logits) v = dist(rng);
+  for (auto& v : host_bias) v = dist(rng) * 0.25f;
+
+  auto* cpu_kernel = reinterpret_cast<vt::SigmoidBiasTopKFn>(
+      vt::GetOp(vt::OpId::kSigmoidBiasTopK, DeviceType::kCPU));
+  Tensor cpu_logits = Tensor::Contiguous(
+      const_cast<float*>(host_logits.data()), vt::DType::kF32,
+      Device{DeviceType::kCPU, 0}, {T, E});
+  Tensor cpu_bias = Tensor::Contiguous(
+      const_cast<float*>(host_bias.data()), vt::DType::kF32,
+      Device{DeviceType::kCPU, 0}, {E});
+  std::vector<float> cpu_w(T * K);
+  std::vector<int32_t> cpu_ids(T * K);
+  Tensor cpu_wt = Tensor::Contiguous(cpu_w.data(), vt::DType::kF32,
+                                     Device{DeviceType::kCPU, 0}, {T, K});
+  Tensor cpu_idt = Tensor::Contiguous(cpu_ids.data(), vt::DType::kI32,
+                                      Device{DeviceType::kCPU, 0}, {T, K});
+  Queue cpu_q{Device{DeviceType::kCPU, 0}, nullptr, 0};
+  cpu_kernel(cpu_q, cpu_wt, cpu_idt, cpu_logits, cpu_bias, K);
+
+  void* mem_logits = backend.Alloc(host_logits.size() * sizeof(float));
+  void* mem_bias = backend.Alloc(host_bias.size() * sizeof(float));
+  void* mem_w = backend.Alloc(T * K * sizeof(float));
+  void* mem_ids = backend.Alloc(T * K * sizeof(int32_t));
+  backend.Copy(q, mem_logits, host_logits.data(),
+               host_logits.size() * sizeof(float));
+  backend.Copy(q, mem_bias, host_bias.data(), host_bias.size() * sizeof(float));
+  Tensor dev_logits = Tensor::Contiguous(
+      mem_logits, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {T, E});
+  Tensor dev_bias = Tensor::Contiguous(
+      mem_bias, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {E});
+  Tensor dev_w = Tensor::Contiguous(
+      mem_w, vt::DType::kF32, Device{DeviceType::kTENSTORRENT, 0}, {T, K});
+  Tensor dev_ids = Tensor::Contiguous(
+      mem_ids, vt::DType::kI32, Device{DeviceType::kTENSTORRENT, 0}, {T, K});
+  vt::SigmoidBiasTopK(q, dev_w, dev_ids, dev_logits, dev_bias, K);
+
+  std::vector<float> tt_w(T * K);
+  std::vector<int32_t> tt_ids(T * K);
+  backend.Copy(q, tt_w.data(), mem_w, tt_w.size() * sizeof(float));
+  backend.Copy(q, tt_ids.data(), mem_ids, tt_ids.size() * sizeof(int32_t));
+  backend.Synchronize(q);
+  backend.Free(mem_logits);
+  backend.Free(mem_bias);
+  backend.Free(mem_w);
+  backend.Free(mem_ids);
+
+  for (int64_t i = 0; i < T; ++i) {
+    // The selection is a SET: the device top-k must pick the SAME experts as
+    // the CPU reference. The ORDER may differ: the substrate selects on
+    // bf16-rounded scores, so two experts whose f32 scores differ slightly
+    // can tie in bf16 and swap positions. Order within the top-k is benign
+    // to the model math — the combine sums weight x expert over the k slots
+    // and the dispatch dedups — and the deviation is recorded in the TT
+    // kernel comment.
+    std::vector<int32_t> cpu_set(cpu_ids.begin() + static_cast<long>(i * K),
+                                 cpu_ids.begin() + static_cast<long>((i + 1) * K));
+    std::vector<int32_t> tt_set(tt_ids.begin() + static_cast<long>(i * K),
+                                tt_ids.begin() + static_cast<long>((i + 1) * K));
+    std::sort(cpu_set.begin(), cpu_set.end());
+    std::sort(tt_set.begin(), tt_set.end());
+    REQUIRE(cpu_set.size() == K);
+    CHECK(tt_set == cpu_set);
+    for (int j = 0; j < K; ++j) {
+      const int32_t id = tt_ids[static_cast<size_t>(i * K + j)];
+      // Each returned weight is sigmoid of the UNBIASED logit AT ITS OWN id
+      // (the biased score selects, the unbiased logit weights), within the
+      // elementwise envelope (device sigmoid vs host std::exp).
+      const float expect =
+          1.0f / (1.0f + std::exp(-host_logits[static_cast<size_t>(i * E + id)]));
+      CHECK(std::fabs(tt_w[static_cast<size_t>(i * K + j)] - expect) < 2e-3f);
+      // And it must equal the CPU reference weight for the SAME id.
+      const auto pos = std::find(cpu_ids.begin() + static_cast<long>(i * K),
+                                 cpu_ids.begin() + static_cast<long>((i + 1) * K),
+                                 id);
+      REQUIRE(pos != cpu_ids.begin() + static_cast<long>((i + 1) * K));
+      const auto cpos = static_cast<int64_t>(pos - cpu_ids.begin());
+      CHECK(std::fabs(tt_w[static_cast<size_t>(i * K + j)] -
+                      cpu_w[static_cast<size_t>(cpos)]) < 2e-3f);
+    }
+  }
+
+  // The tie CONTRACT is on the CPU reference: two experts with an exactly
+  // equal biased score select the LOWER index first (host convention, pinned
+  // so a TT-arm tie-order deviation is at least a RECORDED deviation).
+  {
+    std::vector<float> tl(1 * 4), tb(4, 0.0f);
+    tl[0] = 1.0f; tl[1] = 3.0f; tl[2] = 3.0f; tl[3] = 0.0f;  // tie at 1,2
+    Tensor cl = Tensor::Contiguous(tl.data(), vt::DType::kF32,
+                                   Device{DeviceType::kCPU, 0}, {1, 4});
+    Tensor cb = Tensor::Contiguous(tb.data(), vt::DType::kF32,
+                                   Device{DeviceType::kCPU, 0}, {4});
+    std::vector<float> cw(1 * 2);
+    std::vector<int32_t> ci(1 * 2);
+    Tensor cwt = Tensor::Contiguous(cw.data(), vt::DType::kF32,
+                                    Device{DeviceType::kCPU, 0}, {1, 2});
+    Tensor cit = Tensor::Contiguous(ci.data(), vt::DType::kI32,
+                                    Device{DeviceType::kCPU, 0}, {1, 2});
+    cpu_kernel(cpu_q, cwt, cit, cl, cb, 2);
+    CHECK(ci[0] == 1);
+    CHECK(ci[1] == 2);
+  }
+}
+TEST_CASE("tt residency: freeing a buffer drops the weight-view shadows "
+          "keyed inside it (stale-serve regression)") {
+  if (!TenstorrentPresent()) {
+    MESSAGE("SKIPPED: no Tenstorrent device on this box");
+    return;
+  }
+  Backend& backend = vt::GetBackend(DeviceType::kTENSTORRENT);
+  // A 64 KiB host allocation; the weight view is an INTERIOR bf16 window —
+  // exactly the kolibri1 memo dequant's up/down view shape (an interior
+  // pointer cached in WeightViewShadows, keyed by the view's host pointer).
+  constexpr size_t kBytes = 64 * 1024;
+  void* host = backend.Alloc(kBytes);
+  std::vector<uint16_t> pattern(kBytes / 2);
+  for (size_t i = 0; i < pattern.size(); ++i)
+    pattern[i] = static_cast<uint16_t>(i % 251);
+  std::memcpy(host, pattern.data(), kBytes);
+
+  auto* view_base = static_cast<char*>(host) + kBytes / 2;
+  Tensor view = Tensor::Contiguous(view_base, vt::DType::kBF16,
+                                   Device{DeviceType::kTENSTORRENT, 0},
+                                   {32, 32});
+  const size_t before = vt::tenstorrent::WeightViewShadowCountForTest();
+  vt::tenstorrent::StageWeightViewForTest(view);
+  // The interior view staged its own persistent shadow, keyed by its
+  // pointer (NOT the base's slot — the interior-view rule).
+  CHECK(vt::tenstorrent::WeightViewShadowCountForTest() == before + 1);
+
+  // Freeing the owning buffer must drop the entry keyed inside it: the
+  // address is about to be reused, and a surviving entry would serve the
+  // previous tenant's device bytes to the new tenant's view (the old code
+  // leaked the entry — the kolibri1 memo eviction's address reuse then
+  // stale-served the OLD expert's weights to the new expert's GEMM).
+  backend.Free(host);
+  CHECK(vt::tenstorrent::WeightViewShadowCountForTest() == before);
+}
+
